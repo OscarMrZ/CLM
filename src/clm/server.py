@@ -5,6 +5,7 @@
 
     POST /v1/systemone   {"state": ..., "model": "clm-latest", "questions": {id: Question},
                           "temperature": 1.0}          -> {"model", "answers": {id: Answer}, "usage"}
+                         a state may be a list of content parts (text + image_url) -- see clm.content
     POST /v1/rank        {"context": ..., "question": ..., "answers": [...]}
                                                        -> {"model", "ranked": [{rank, candidate, prob}]}
     GET  /v1/models      -> {"models": [{"name", "description", "release_date"}]}
@@ -172,6 +173,13 @@ def main() -> None:
     ap.add_argument("--emb-model", default=os.environ.get("CLM_EMB_MODEL", "qwen3-8b"))
     ap.add_argument("--max-tokens", type=int, default=int(os.environ.get("CLM_EMB_MAX_TOKENS", 2048)),
                     help="truncate texts to this many tokens before embedding (the embedder's max-model-len)")
+    ap.add_argument("--state-chat", action="store_true",
+                    default=os.environ.get("CLM_STATE_CHAT", "").lower() in ("1", "true", "yes"),
+                    help="send every state through the encoder's chat template (vLLM chat embeddings), not only "
+                         "states with images; for a vision-language encoder. Environment: CLM_STATE_CHAT=1")
+    ap.add_argument("--emb-instruction", default=os.environ.get("CLM_EMB_INSTRUCTION") or None, metavar="TEXT",
+                    help="system prompt for chat embedding requests, e.g. \"Represent the user's input.\" for "
+                         "Qwen3-VL-Embedding. Environment: CLM_EMB_INSTRUCTION")
     ap.add_argument("--ckpt", default=os.environ.get("CLM_CKPT"),
                     help=f"checkpoint served as clm-latest (default: {DEFAULT_CKPT_DIR}/{HF_FILE}, downloaded if missing)")
     ap.add_argument("--ckpt-dir", default=None, help="also serve every *.pt in this directory under its file stem")
@@ -200,15 +208,17 @@ def main() -> None:
             raise SystemExit(f"--model expects NAME=PATH, got {spec!r}")
         extra[name] = path
     device = args.device or default_device()
-    engine = Engine(Embedder(args.emb_url, args.emb_model, max_tokens=args.max_tokens), checkpoint=ckpt,
-                    models=extra, checkpoint_dir=args.ckpt_dir, device=device,
-                    action_cache=args.action_cache)
+    engine = Engine(Embedder(args.emb_url, args.emb_model, max_tokens=args.max_tokens,
+                             instruction=args.emb_instruction),
+                    checkpoint=ckpt, models=extra, checkpoint_dir=args.ckpt_dir, device=device,
+                    action_cache=args.action_cache, state_chat=args.state_chat)
     if not engine.heads and not extra:
         raise SystemExit("no checkpoint: pass --ckpt or let clm-serve download the reference head")
     api_key = os.environ.get("CLM_API_KEY")
     app = create_app(engine, api_key, ui=not args.no_ui, cors=args.cors)
     print(f"[clm] models {[m['name'] for m in engine.models()]} on {device}", flush=True)
     print(f"[clm] embedder {args.emb_url} ({args.emb_model}) {'up' if engine.embedder.healthy() else 'NOT REACHABLE'}; "
+          f"states {'chat template' if engine.state_chat else 'plain text (images -> chat)'}; "
           f"auth {'on' if api_key else 'off'}", flush=True)
     arena = engine.arena
     if arena:

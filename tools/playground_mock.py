@@ -50,10 +50,13 @@ class MockEmbedder:
         self.url = "mock://n-gram"
         self.tokens = 0
 
-    def embed(self, texts: list[str]):
+    def embed(self, items):
         if self.broken:
             raise EmbedderError("embedder unreachable at http://127.0.0.1:8090/v1/embeddings: "
                                 "[Errno 61] Connection refused (this is the mock's --broken mode)")
+        # a Content (state with images) hashes its text plus the image digests, so two
+        # different screenshots with the same caption do not collide
+        texts = [x if isinstance(x, str) else " ".join((x.text, *(i.key[:24] for i in x.images))) for x in items]
         self.tokens += sum(max(1, len(t) // 4) for t in texts)
         return [_embed(t) for t in texts], sum(max(1, len(t) // 4) for t in texts)
 

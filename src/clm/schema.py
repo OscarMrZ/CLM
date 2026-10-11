@@ -20,6 +20,8 @@ import json
 import math
 from typing import Any
 
+from .content import Content, split_parts
+
 QUESTION_TYPES = ("noul", "choice", "score")
 NOUL_KEYS = ("false", "true")
 
@@ -60,9 +62,24 @@ def to_text(x: Any, indent: int = 0) -> str:
 
 
 def state_text(state: Any, instructions: Any) -> str:
-    """Context first, question last — the layout the heads were trained on."""
+    """Context first, question last — the layout the heads were trained on.
+
+    A content-part state (see ``clm.content``) contributes its text parts only;
+    ``state_input`` is the form that keeps the images.
+    """
+    state, _ = split_parts(state)
     s, i = to_text(state).strip(), to_text(instructions).strip()
     return f"{s}\n\n{i}" if s and i else (s or i)
+
+
+def state_input(state: Any, instructions: Any, chat: bool = False) -> str | Content:
+    """What the state head's encoder sees: plain text for a text-only state, a
+    ``Content`` (text + images) when the state carries images.  ``chat=True``
+    wraps text-only states too, so every state takes the encoder's chat path
+    (a multimodal encoder expects its chat template around the state)."""
+    text_state, images = split_parts(state)
+    text = state_text(text_state, instructions)
+    return Content(text, tuple(images)) if images or chat else text
 
 
 def _norm_question(q: dict) -> dict:
@@ -101,15 +118,19 @@ def candidates(q: dict) -> tuple[list[str], list[str]]:
     return list(NOUL_KEYS), texts
 
 
-def build_pairs(state: Any, questions: dict[str, dict]) -> dict[str, tuple[str, list[str], list[str]]]:
-    """{qid: (state_text, option_keys, candidate_texts)} for every question.
+def build_pairs(state: Any, questions: dict[str, dict],
+                chat: bool = False) -> dict[str, tuple[str | Content, list[str], list[str]]]:
+    """{qid: (state_input, option_keys, candidate_texts)} for every question.
+
+    ``state_input`` is a string, or a ``Content`` when the state carries images
+    (or ``chat=True``); candidates are always plain text.
 
     The state head sees ``context + question``: the state is the context and the
     question's instructions are the question, appended after a blank line.  That is
     the layout the heads are trained on, so callers should put the question in
     ``instructions`` and not repeat it inside the state.
     """
-    return {qid: (state_text(state, q.get("instructions")), *candidates(q)) for qid, q in questions.items()}
+    return {qid: (state_input(state, q.get("instructions"), chat), *candidates(q)) for qid, q in questions.items()}
 
 
 def softmax(logits: list[float]) -> list[float]:

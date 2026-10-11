@@ -111,6 +111,42 @@ engine.rank("What causes tides on Earth?",
 engine.answer(state, questions)      # the same dict the HTTP endpoint returns, no server needed
 ```
 
+### States with images
+
+A state may carry screenshots or camera frames: write it as a list of **content
+parts** (the shape chat APIs use), and serve a vision-language encoder behind
+`clm-serve --state-chat`:
+
+```bash
+# 1. multimodal encoder (Qwen3-VL-8B, FP8 fits a 16 GB GPU)
+./serve_qwen3_vl_8b.sh                 # vllm serve Qwen/Qwen3-VL-8B-Instruct-FP8 --runner pooling --convert embed ...
+# 2. CLM API: every state through the encoder's chat template, with a head trained on it
+clm-serve --emb-model qwen3-vl-8b --state-chat --ckpt runs/screens/best_head.pt
+```
+
+```python
+from clm import CLMClient, Choice, with_images
+
+r = CLMClient().system_one(
+    state=with_images("Checkout page, the card form is filled in.", ["screenshot.png"]),
+    questions={"next": Choice(instructions="Which element should be clicked next?",
+                              criteria={"pay": "The Pay now button", "back": "Back to cart", "promo": "Add promo code"})},
+)
+```
+
+`with_images` inlines files as `data:` URIs; the wire format is
+`[{"type": "text", "text": ...}, {"type": "image_url", "image_url": {"url": ...}}]`
+(`data:` URIs or `http(s)` URLs — never server paths). The text parts and the
+question form the state text as before; the images travel with it to the encoder
+in a chat embeddings request, and the cache keys the state by its text plus a
+digest of each image. Candidates stay plain text. The playground attaches images
+with **+ image** or by pasting a screenshot into the state box.
+
+The released head is trained on Qwen3-8B text embeddings: image states need a
+head trained against the multimodal encoder (`train/finetune.py --task clm --data
+steps.jsonl` with an `images` field per step, or `--task choice` rows whose state is
+a content-part list; see [docs/FINETUNING.md](docs/FINETUNING.md)).
+
 ---
 
 ## Playground
@@ -344,12 +380,14 @@ The code in this repository is released under the [Apache 2.0 License](LICENSE).
 .
 ├── pyproject.toml               # the clm package (installed editable by requirements.txt)
 ├── serve_qwen3_8b.sh            # launch the Qwen3-8B pooling encoder on a GPU
+├── serve_qwen3_vl_8b.sh         # launch a Qwen3-VL multimodal encoder (states with images)
 ├── download_head.sh             # fetch the released head (`clm-download` does the same)
 ├── assets/                      # logo + the playground screenshot used above
 ├── src/clm/                     # inference: the package `clm-serve` and `clm` ship
 │   ├── __init__.py              #   from clm import CLMClient, Noul, Choice, Score, Engine
 │   ├── client.py                #   CLMClient + question / answer types (no torch needed)
 │   ├── schema.py                #   question -> (state text, candidate texts); logits -> Answer
+│   ├── content.py               #   states with images: content parts, data: URIs, cache keys
 │   ├── engine.py                #   Engine.answer(...) / Engine.rank(...): the inference engine
 │   ├── heads.py                 #   head architecture, checkpoint load / hot-reload / download
 │   ├── embedder.py              #   /v1/embeddings client + LRU cache of normalised embeddings
@@ -362,6 +400,7 @@ The code in this repository is released under the [Apache 2.0 License](LICENSE).
 │   ├── adapters.py              #   dataset adapters: agentic traces, typed decisions
 │   └── embed_utils.py           #   encoder embeddings with the training token recipe
 ├── evaluation/bon_eval.py            # unified best-of-N evaluation
+├── tests/                       # pytest: content parts, embedder, engine, server, trainer embedding
 ├── preprocessing/hf_embeddings.py    # embedding dir <-> Hugging Face dataset
 ├── requirements.txt             # pip install -r requirements.txt  (clm + torch + vLLM + example deps)
 ├── examples/                    # CLM vs Jev on the T-Rex runner (examples/t_rex/README.md)
@@ -383,7 +422,7 @@ live in the research repo's `main` branch.
 
 | field | |
 | --- | --- |
-| `state` | string, object or array (objects are rendered as `key: value` text, arrays as `- item` lines; never JSON, the heads are trained on prose) |
+| `state` | string, object or array (objects are rendered as `key: value` text, arrays as `- item` lines; never JSON, the heads are trained on prose); or a list of content parts `{"type": "text"|"image_url", ...}` for a state with images (see [above](#states-with-images)) |
 | `model` | `clm-latest` (default), `clm-raw`, or any model from `GET /v1/models` |
 | `questions` | `{id: Question}`, at least one |
 | `temperature` | optional, `(0, 100]`, default 1; divides the logits before the softmax |
@@ -426,8 +465,14 @@ files only; every API route above shadows it.
 ```
 clm-serve [--port 8700] [--emb-url http://127.0.0.1:8090/v1/embeddings] [--emb-model qwen3-8b]
           [--max-tokens 2048] [--ckpt PATH] [--ckpt-dir DIR] [--model NAME=PATH ...] [--device cpu|cuda]
-          [--action-cache 0.02|512MiB|0] [--no-ui] [--cors]
+          [--action-cache 0.02|512MiB|0] [--state-chat] [--emb-instruction TEXT] [--no-ui] [--cors]
 ```
+
+`--state-chat` sends every state as a vLLM chat embeddings request (the encoder's
+chat template), which a multimodal encoder expects and a head trained with
+`finetune.py --state-chat` was fitted to; states with images always go that way.
+`--emb-instruction` is the system prompt of those requests (Qwen3-VL-Embedding:
+`"Represent the user's input."`). Environment: `CLM_STATE_CHAT`, `CLM_EMB_INSTRUCTION`.
 
 `--ckpt PATH` serves your own head as `clm-latest` (default: the reference
 head in `~/.cache/clm/`, downloaded if missing); `--ckpt-dir DIR` serves every

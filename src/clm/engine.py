@@ -17,6 +17,7 @@ import os
 from typing import Any
 
 from .cache import CacheDisabled, VectorArena
+from .content import cache_key
 from .client import question_to_dict
 from .embedder import Embedder
 from .heads import HIDDEN, HeadPair, default_checkpoint, default_device
@@ -36,9 +37,15 @@ class ModelNotFound(KeyError):
 class Engine:
     def __init__(self, embedder: Embedder | None = None, checkpoint: str | None = None,
                  models: dict[str, str] | None = None, checkpoint_dir: str | None = None, device: str | None = None,
-                 emb_url: str | None = None, emb_model: str | None = None, action_cache: Any = None):
+                 emb_url: str | None = None, emb_model: str | None = None, action_cache: Any = None,
+                 state_chat: bool | None = None):
         self.embedder = embedder or Embedder(url=emb_url or os.environ.get("CLM_EMB_URL", "http://127.0.0.1:8090/v1/embeddings"),
-                                             model=emb_model or os.environ.get("CLM_EMB_MODEL", "qwen3-8b"))
+                                             model=emb_model or os.environ.get("CLM_EMB_MODEL", "qwen3-8b"),
+                                             instruction=os.environ.get("CLM_EMB_INSTRUCTION") or None)
+        # Every state through the encoder's chat path (a multimodal encoder's template),
+        # not only the ones that carry images.  Candidates always go as plain text.
+        self.state_chat = (os.environ.get("CLM_STATE_CHAT", "").lower() in ("1", "true", "yes")
+                           if state_chat is None else bool(state_chat))
         device = device or default_device()
         self.heads: dict[str, HeadPair] = {}
         ck = checkpoint or default_checkpoint()
@@ -72,16 +79,17 @@ class Engine:
         return arena
 
     # ------------------------------------------------------------------ cached vectors
-    def _cached(self, namespace: str, dim: int, texts: list[str], tokens: list[int], project=None):
-        """Vectors for ``texts``, from the arena where possible; ``tokens`` collects misses."""
-        def compute(missing: list[str]):
+    def _cached(self, namespace: str, dim: int, items: list, tokens: list[int], project=None):
+        """Vectors for ``items`` (texts or ``Content``), from the arena where possible;
+        ``tokens`` collects encoder tokens spent on misses."""
+        def compute(missing: list):
             emb, spent = self.embedder.embed(missing)
             tokens.append(spent)
             return project(emb) if project else self._to_device(emb)
 
         if self.arena is None:
-            return compute(texts)
-        return self.arena.get(namespace, dim, texts, compute)
+            return compute(items)
+        return self.arena.get(namespace, dim, items, compute, [cache_key(x) for x in items])
 
     def _to_device(self, x):
         import torch
@@ -115,7 +123,7 @@ class Engine:
         else:
             raise ModelNotFound(f"unknown model {model!r}; available: {[m['name'] for m in self.models()]}")
         questions = {k: question_to_dict(q) for k, q in questions.items()}   # Noul/Choice/Score or dicts
-        pairs = build_pairs(state, questions)          # ValueError on malformed questions
+        pairs = build_pairs(state, questions, chat=self.state_chat)   # ValueError on malformed questions
         states = [p[0] for p in pairs.values()]
         cands = [t for p in pairs.values() for t in p[2]]
         tokens: list[int] = []

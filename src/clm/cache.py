@@ -125,19 +125,23 @@ class VectorArena:
             return pool
 
     # ---------------------------------------------------------------- lookup
-    def get(self, namespace: str, dim: int, texts: list[str], compute: Callable[[list[str]], Any]) -> Any:
-        """-> [len(texts), dim] device tensor; ``compute`` fills the misses, in order."""
+    def get(self, namespace: str, dim: int, items: list[Any], compute: Callable[[list[Any]], Any],
+            keys: list[str] | None = None) -> Any:
+        """-> [len(items), dim] device tensor; ``compute`` fills the misses, in order.
+
+        ``keys`` identify the items (default: the items themselves, which must then be
+        strings); a multimodal state is keyed by its text and image digests."""
         pool = self.pools.get(dim)
         if pool is None:
-            return compute(texts)
-        keys = [f"{namespace}\x00{t}" for t in texts]
+            return compute(items)
+        keys = [f"{namespace}\x00{k}" for k in (keys if keys is not None else items)]
         with self._lock:
             missing, missing_keys = [], []
-            for text, key in zip(texts, keys):
+            for item, key in zip(items, keys):
                 slot = pool.slots.get(key)
                 if slot is None:
                     if key not in missing_keys:
-                        missing.append(text); missing_keys.append(key)
+                        missing.append(item); missing_keys.append(key)
                 else:
                     pool.slots.move_to_end(key)
                     pool.hits += 1
@@ -152,7 +156,7 @@ class VectorArena:
             # handed the slot to another key since it was filled.
             rows = [pool.slots.get(k) for k in keys]
             if any(r is None for r in rows):
-                return compute(texts)                # thrashing; answer without the arena
+                return compute(items)                # thrashing; answer without the arena
             index = self.torch.as_tensor(rows, device=self.device, dtype=self.torch.long)
             return pool.buffer.index_select(0, index)   # copies while the lock is held
 
