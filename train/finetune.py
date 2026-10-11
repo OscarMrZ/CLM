@@ -17,7 +17,9 @@ Embeddings (clm)
   --emb-dir DIR        embedding dir (embed_shard.py + merge_embeddings.py output)
   --hf-dataset REPO    native or parquet embedding dataset (defaults from
                        --benchmark when no CLM data source is supplied)
-  --data FILE          step transitions (.json / .jsonl), embedded from scratch
+  --data FILE          step transitions (.json / .jsonl), embedded from scratch;
+                       a step's optional ``images`` (paths / URLs) are embedded with
+                       its state by a multimodal encoder (--embed-model Qwen/Qwen3-VL-...)
 choice always embeds from scratch, with offline vLLM or a vLLM pooling server
 (``--embed-url``).
 
@@ -50,6 +52,7 @@ sys.path.insert(0, os.path.join(REPO, "preprocessing"))
 sys.path.insert(0, HERE)
 import adapters  # noqa: E402
 import embed_utils  # noqa: E402
+from clm.content import Content, cache_key  # noqa: E402
 import hf_embeddings  # noqa: E402
 from clm.heads import make_head  # noqa: E402
 
@@ -132,17 +135,28 @@ def clm_embedding_dir(args) -> str:
         print(f"[clm] reusing embeddings in {out}", flush=True)
         return out
     recs = adapters.read_transitions(args.data)
+    chat = args.state_chat or adapters.has_images(recs)
+    if adapters.has_images(recs) and not args.state_chat:
+        print("[clm] steps carry images: states take the encoder's chat path (--state-chat implied)", flush=True)
     recipe = embed_utils.Recipe(args.embed_model, args.max_len)
     backend = embed_utils.make_backend(args.embed_url, args.embed_model, args.max_len, args.gpu_mem,
-                                       args.served_model_name)
-    print(f"[clm] embedding {len(recs)} steps from scratch", flush=True)
-    se = backend.embed([recipe.state_ids(r["state"]) for r in recs])
+                                       args.served_model_name, convert=args.convert,
+                                       max_images=max([len(r.get("images") or []) for r in recs] + [1]))
+    print(f"[clm] embedding {len(recs)} steps from scratch"
+          f"{' (chat path, images)' if chat else ''}", flush=True)
+    if chat:
+        se = backend.embed_chat([embed_utils.chat_messages(r["state"], r.get("images"), args.embed_instruction)
+                                 for r in recs])
+    else:
+        se = backend.embed([recipe.state_ids(r["state"]) for r in recs])
     ae = backend.embed([recipe.text_ids(r["action"], keep="head") for r in recs])
     os.makedirs(out, exist_ok=True)
     torch.save(torch.from_numpy(se.astype(np.float16)), os.path.join(out, "state_embeddings.pt"))
     torch.save(torch.from_numpy(ae.astype(np.float16)), os.path.join(out, "action_embeddings.pt"))
     meta = {"num_samples": len(recs), "hidden_size": int(se.shape[1]), "model_name": args.embed_model,
             "max_model_len": args.max_len, "input_file": os.path.abspath(args.data),
+            "state_chat": chat, "instruction": args.embed_instruction,
+            "images": sum(1 for r in recs if r.get("images")),
             "samples": [{k: r.get(k) for k in hf_embeddings.META_KEYS} for r in recs]}
     json.dump(meta, open(os.path.join(out, "metadata.json"), "w"))
     return out
@@ -310,12 +324,15 @@ def _train_clm(args, emb_dir, out_dir, holdout_path):
                 else metrics["within_task_top1"])
 
     def checkpoint_blob(epoch, metrics):
+        # how the states were embedded travels with the head: clm-serve needs the same encoder,
+        # and --state-chat / --emb-instruction when the head was trained on the chat path
+        encoder = {k: metadata.get(k) for k in ("model_name", "state_chat", "instruction") if k in metadata}
         return {"state_head": state_head.state_dict(), "action_head": action_head.state_dict(),
                 "logit_scale": logit_scale.detach().cpu(),
                 "cfg": {"width": width, "depth": depth, "projection_dim": args.proj,
                         "hidden_size": hidden, **head_options, "init_ckpt": args.init_ckpt,
                         "sampler": args.sampler, "batch": args.batch, "lr": lr,
-                        "train_dir": emb_dir}, "epoch": epoch, "metrics": metrics}
+                        "train_dir": emb_dir, **encoder}, "epoch": epoch, "metrics": metrics}
 
     initial_metrics = _evaluate_clm(state_head, action_head, logit_scale, val, args.batch)
     history = [{"epoch": 0, **initial_metrics}]
@@ -466,14 +483,29 @@ def run_choice(args) -> dict:
 
     cache = TextCache(os.path.join(args.embed_cache or os.path.join(args.out_dir, "embeddings"),
                                    f"choice_{_slug(args.embed_model)}_{args.max_len}.npz"))
-    texts = [t for v in ex.values() for e in v for t in (e.state_text, *e.candidates)]
-    todo = cache.missing(texts)
-    if todo:
+    # Every state that takes the encoder's chat path is a Content: one with images, or any
+    # state under --state-chat.  Its cache key (clm.content.cache_key) differs from the same
+    # words as a plain candidate text, so the two never share a vector.
+    if args.state_chat:
+        for v in ex.values():
+            for e in v:
+                if isinstance(e.state_text, str):
+                    e.state_text = Content(e.state_text)
+    cands = list(dict.fromkeys(t for v in ex.values() for e in v for t in e.candidates))
+    states = {cache_key(e.state_text): e.state_text for v in ex.values() for e in v}
+    todo_text = [t for t in cands + [st for st in states.values() if isinstance(st, str)] if cache.key(t) not in cache.vecs]
+    todo_chat = [st for st in states.values() if isinstance(st, Content) and cache.key(st.key) not in cache.vecs]
+    if todo_text or todo_chat:
         recipe = embed_utils.Recipe(args.embed_model, args.max_len)
         backend = embed_utils.make_backend(args.embed_url, args.embed_model, args.max_len, args.gpu_mem,
-                                           args.served_model_name)
-        print(f"[choice] embedding {len(todo)} unique texts", flush=True)
-        cache.add(todo, backend.embed([recipe.text_ids(t, keep="tail") for t in todo]))
+                                           args.served_model_name, convert=args.convert)
+        print(f"[choice] embedding {len(todo_text)} texts, {len(todo_chat)} states on the chat path "
+              f"({sum(1 for c in todo_chat if c.images)} with images)", flush=True)
+        if todo_text:
+            cache.add(todo_text, backend.embed([recipe.text_ids(t, keep="tail") for t in todo_text]))
+        if todo_chat:
+            cache.add([c.key for c in todo_chat],
+                      backend.embed_chat([c.messages(args.embed_instruction) for c in todo_chat]))
 
     device = torch.device(f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu")
 
@@ -483,7 +515,7 @@ def run_choice(args) -> dict:
             buckets[len(e.keys)].append(e)
         out = []
         for k, es in buckets.items():
-            q = torch.tensor(np.stack([cache[e.state_text] for e in es]), dtype=torch.float32)
+            q = torch.tensor(np.stack([cache[cache_key(e.state_text)] for e in es]), dtype=torch.float32)
             c = torch.tensor(np.stack([[cache[t] for t in e.candidates] for e in es]), dtype=torch.float32)
             out.append((q.to(device), c.to(device),
                         torch.tensor([e.target for e in es], device=device),
@@ -519,10 +551,10 @@ def run_choice(args) -> dict:
 
     if args.loss == "infonce":  # flat train set: every text once, options as indices into it
         tr = ex["train"]
-        text_id = {t: i for i, t in enumerate(dict.fromkeys(t for e in tr for t in (e.state_text, *e.candidates)))}
+        text_id = {t: i for i, t in enumerate(dict.fromkeys(t for e in tr for t in (cache_key(e.state_text), *e.candidates)))}
         emb = torch.tensor(np.stack([cache[t] for t in text_id]), dtype=torch.float32, device=device)
         kmax = max(len(e.keys) for e in tr)
-        st_idx = torch.tensor([text_id[e.state_text] for e in tr], device=device)
+        st_idx = torch.tensor([text_id[cache_key(e.state_text)] for e in tr], device=device)
         opt_idx = torch.tensor([[text_id[t] for t in e.candidates] + [-1] * (kmax - len(e.keys)) for e in tr],
                                device=device)
         opt_tgt = torch.tensor([(e.target if args.targets == "soft" else
@@ -590,6 +622,7 @@ def run_choice(args) -> dict:
                 "cfg": {**cfg, "projection_dim": proj, "hidden_size": HIDDEN, "task": "choice",
                         "targets": args.targets, "loss": args.loss, "data": args.data, "workflow": args.workflow,
                         "embed_model": args.embed_model, "max_len": args.max_len,
+                        "state_chat": bool(args.state_chat), "instruction": args.embed_instruction,
                         "init_ckpt": os.path.basename(args.init_ckpt) if args.init_ckpt else None},
                 "epoch": epoch, "metrics": metrics}
 
@@ -664,6 +697,14 @@ def main() -> None:
     emb.add_argument("--max-len", type=int, default=None, help="token budget (default 8192 clm, 2048 choice)")
     emb.add_argument("--gpu-mem", type=float, default=0.85)
     emb.add_argument("--embed-cache", default=None, help="where embeddings are cached (default OUT/embeddings)")
+    emb.add_argument("--state-chat", action="store_true",
+                     help="embed states through the encoder's chat template (vLLM chat embeddings / rendered "
+                          "offline); implied when steps carry images. Serve the head with clm-serve --state-chat")
+    emb.add_argument("--embed-instruction", default=None, metavar="TEXT",
+                     help="system prompt for the chat path (Qwen3-VL-Embedding: \"Represent the user's input.\")")
+    emb.add_argument("--convert", default=None, choices=["embed"],
+                     help="offline vLLM only: convert a generative encoder (e.g. Qwen3-VL-8B-Instruct) to a "
+                          "last-token pooling model")
     hd = ap.add_argument_group("heads / optimisation")
     hd.add_argument("--init-ckpt", default=None, help="warm-start checkpoint")
     hd.add_argument("--width", type=int, default=None)

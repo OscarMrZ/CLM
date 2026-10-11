@@ -3,6 +3,9 @@
 * ``read_transitions``: step transitions (``state`` chat messages, ``action``,
   ``task_id``, ``step_idx``, ``trajectory_id``, ``reward``) as written by
   the DeepSWE trace builder in the research repo's ``main`` branch, returned unchanged.
+  A step may also carry ``images``: a list of image paths (relative to the
+  transitions file) or URLs that belong to its state -- screenshots, camera
+  frames -- embedded alongside the text by a multimodal encoder.
 * ``typed_decision_examples``: System One typed questions
   (``LocalLLaMA/typed-decisions``); each (row, question) becomes a state text, option
   keys, candidate texts (``clm.schema.build_pairs``) and the gold distribution.
@@ -16,24 +19,39 @@ from dataclasses import dataclass, field
 from typing import Iterable, Iterator
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
+from clm.content import Content  # noqa: E402
 from clm.schema import build_pairs  # noqa: E402
 
 TRANSITION_KEYS = ("state", "action", "task_id", "step_idx")
 
 
 def read_transitions(path: str) -> list[dict]:
-    """Load step transitions from a ``.jsonl`` (one object per line) or ``.json`` (array) file."""
+    """Load step transitions from a ``.jsonl`` (one object per line) or ``.json`` (array) file.
+
+    Relative image paths in ``images`` are resolved against the file's directory."""
     if path.endswith(".jsonl"):
         with open(path) as f:
             recs = [json.loads(line) for line in f if line.strip()]
     else:
         with open(path) as f:
             recs = json.load(f)
+    base = os.path.dirname(os.path.abspath(path))
     for i, r in enumerate(recs):
         missing = [k for k in TRANSITION_KEYS if k not in r]
         if missing:
             raise ValueError(f"{path}: record {i} is missing {missing}")
+        images = r.get("images")
+        if images is None:
+            continue
+        if not isinstance(images, list) or not all(isinstance(x, str) and x for x in images):
+            raise ValueError(f"{path}: record {i}: images must be a list of paths or URLs")
+        r["images"] = [x if "://" in x or x.startswith("data:") or os.path.isabs(x) else os.path.join(base, x)
+                       for x in images]
     return recs
+
+
+def has_images(recs: list[dict]) -> bool:
+    return any(r.get("images") for r in recs)
 
 
 def _maybe_json(x):
@@ -56,7 +74,7 @@ def _key_of(label) -> str:
 @dataclass
 class ChoiceExample:
     qid: str
-    state_text: str
+    state_text: str | Content     # a Content when the state carries images
     keys: list[str]
     candidates: list[str]
     target: list[float]      # gold distribution over ``keys``

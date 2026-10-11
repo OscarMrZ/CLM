@@ -87,3 +87,28 @@ record a timeout, and reset.
 
 Once the loop begins, do not ask whether to continue. Keep experimenting until
 the user interrupts you.
+
+## Steps with images
+
+`--data steps.jsonl` may carry an `images` list per step (paths relative to the
+file, URLs or `data:` URIs). Such steps are embedded through the encoder's chat
+path with the images attached to the state, so the encoder must be multimodal:
+
+```bash
+./serve_qwen3_vl_8b.sh                                     # Qwen3-VL-8B-Instruct-FP8, --convert embed
+python train/finetune.py --task clm --data data/screens/steps.jsonl --out-dir runs/screens \
+    --embed-url http://127.0.0.1:8090/v1/embeddings --embed-model Qwen/Qwen3-VL-8B-Instruct-FP8 \
+    --served-model-name qwen3-vl-8b --max-len 4096 --batch 256
+clm-serve --emb-model qwen3-vl-8b --state-chat --ckpt runs/screens/best_head.pt
+```
+
+`--state-chat` puts text-only states through the same template (implied when any
+step has images), `--embed-instruction` sets the system prompt (Qwen3-VL-Embedding
+wants `"Represent the user's input."`), and the checkpoint `cfg` records
+`model_name`, `state_chat` and `instruction` so the head is served the way it was
+trained. The same holds for `--task choice`: a typed-decisions row whose `state` is
+a content-part list (text + `image_url`) is embedded with its image.
+
+The released head cannot be warm-started on a different encoder: its 4096-d input
+space is Qwen3-8B's. Heads for a multimodal encoder start from scratch, or from a
+head trained on general image data with the same encoder.

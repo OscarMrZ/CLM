@@ -8,17 +8,68 @@ DeepSWE precompute in the research repo's ``main`` branch.
 
 Backends take token ids: ``OfflineBackend`` (in-process vLLM) and ``ServerBackend``
 (``vllm serve <model> --runner pooling``).
+
+The **chat path** (``embed_chat``) is for a multimodal encoder: a state becomes
+OpenAI-style messages (``chat_messages``), images included, and the encoder's own
+chat template wraps it -- the server renders it from ``messages`` (vLLM chat
+embeddings), the offline backend renders it with the tokenizer and passes PIL
+images.  ``clm-serve --state-chat`` sends states the same way, so a head trained
+on these embeddings sees identical inputs when served.
 """
 from __future__ import annotations
 
 import base64
+import io
 import os
 import sys
+from typing import Any
 
 import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
+from clm.content import image_part  # noqa: E402
 from clm.embedder import EmbedderError, l2  # noqa: E402
+from clm.schema import to_text  # noqa: E402
+
+
+def chat_messages(state: Any, images: list[str] | None = None, instruction: str | None = None) -> list[dict]:
+    """OpenAI-style messages for the encoder's chat path.
+
+    A string (or object / array, rendered as prose) is one user turn: image parts
+    first, then the text -- the layout ``clm.content.Content`` uses at serving time.
+    A list of chat messages is kept as is, with the images attached to its last user
+    turn.  Images are paths, URLs or ``data:`` URIs; paths are inlined as ``data:``
+    URIs so the same messages work against a server.  ``instruction`` becomes the
+    system prompt."""
+    parts = [image_part(x) for x in (images or [])]
+    if isinstance(state, list) and state and all(isinstance(m, dict) and "role" in m for m in state):
+        msgs = [dict(m) for m in state]
+        if parts:
+            last = max((i for i, m in enumerate(msgs) if m["role"] == "user"), default=None)
+            if last is None:
+                msgs.append({"role": "user", "content": parts})
+            else:
+                c = msgs[last]["content"]
+                msgs[last]["content"] = parts + ([{"type": "text", "text": c}] if isinstance(c, str) else list(c))
+    else:
+        text = state if isinstance(state, str) else to_text(state)
+        msgs = [{"role": "user", "content": parts + [{"type": "text", "text": text}]}]
+    if instruction:
+        msgs = [{"role": "system", "content": instruction}] + msgs
+    return msgs
+
+
+def _load_image(url: str):
+    """PIL image from a ``data:`` URI, a URL or a path (offline backend)."""
+    from PIL import Image
+    if url.startswith("data:"):
+        return Image.open(io.BytesIO(base64.b64decode(url.split(",", 1)[1]))).convert("RGB")
+    if "://" in url:
+        import requests
+        r = requests.get(url, timeout=60)
+        r.raise_for_status()
+        return Image.open(io.BytesIO(r.content)).convert("RGB")
+    return Image.open(url).convert("RGB")
 
 
 class Recipe:
@@ -50,20 +101,67 @@ class Recipe:
 
 
 class OfflineBackend:
-    """In-process vLLM pooling model, loaded on first use."""
+    """In-process vLLM pooling model, loaded on first use.
 
-    def __init__(self, model: str, max_len: int, gpu_mem: float = 0.85):
+    ``max_images`` sizes vLLM's per-prompt image limit for the chat path; ``convert``
+    is vLLM's ``--convert`` (``embed`` turns a generative VLM into a last-token
+    pooling encoder; retrieval-tuned models need none)."""
+
+    def __init__(self, model: str, max_len: int, gpu_mem: float = 0.85, max_images: int = 4,
+                 convert: str | None = None):
         self.model, self.max_len, self.gpu_mem = model, max_len, gpu_mem
+        self.max_images, self.convert = max_images, convert
         self._llm = None
+        self._tok = None
+
+    def _load(self):
+        if self._llm is None:
+            from vllm import LLM
+            kw = dict(model=self.model, runner="pooling", enforce_eager=False, max_model_len=self.max_len,
+                      trust_remote_code=True, gpu_memory_utilization=self.gpu_mem,
+                      limit_mm_per_prompt={"image": self.max_images})
+            if self.convert:
+                kw["convert"] = self.convert
+            self._llm = LLM(**kw)
+        return self._llm
 
     def embed(self, id_lists: list[list[int]]) -> np.ndarray:
         from vllm.inputs import TokensPrompt
-        if self._llm is None:
-            from vllm import LLM
-            self._llm = LLM(model=self.model, runner="pooling", enforce_eager=False,
-                            max_model_len=self.max_len, trust_remote_code=True,
-                            gpu_memory_utilization=self.gpu_mem)
-        outs = self._llm.embed([TokensPrompt(prompt_token_ids=ids) for ids in id_lists], use_tqdm=True)
+        outs = self._load().embed([TokensPrompt(prompt_token_ids=ids) for ids in id_lists], use_tqdm=True)
+        return l2(np.stack([np.asarray(o.outputs.embedding, dtype=np.float32) for o in outs]))
+
+    def _render(self, messages: list[dict]) -> tuple[str, list]:
+        """(prompt with the template's image placeholders, PIL images in order)."""
+        if self._tok is None:
+            from transformers import AutoTokenizer
+            self._tok = AutoTokenizer.from_pretrained(self.model, trust_remote_code=True)
+        images, msgs = [], []
+        for m in messages:
+            c = m["content"]
+            if isinstance(c, list):
+                out = []
+                for part in c:
+                    if part["type"] == "text":
+                        out.append({"type": "text", "text": part["text"]})
+                    else:
+                        u = part["image_url"]["url"] if part["type"] == "image_url" else part["image"]
+                        images.append(_load_image(u))
+                        out.append({"type": "image"})
+                c = out
+            msgs.append({"role": m["role"], "content": c})
+        prompt = self._tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+        return prompt, images
+
+    def embed_chat(self, messages_list: list[list[dict]]) -> np.ndarray:
+        llm = self._load()
+        prompts = []
+        for msgs in messages_list:
+            prompt, images = self._render(msgs)
+            p: dict = {"prompt": prompt}
+            if images:
+                p["multi_modal_data"] = {"image": images if len(images) > 1 else images[0]}
+            prompts.append(p)
+        outs = llm.embed(prompts, use_tqdm=True)
         return l2(np.stack([np.asarray(o.outputs.embedding, dtype=np.float32) for o in outs]))
 
 
@@ -78,29 +176,48 @@ class ServerBackend:
         if api_key:
             self.session.headers["Authorization"] = f"Bearer {api_key}"
 
-    def embed(self, id_lists: list[list[int]]) -> np.ndarray:
+    def _post(self, body: dict) -> list[np.ndarray]:
+        """-> vectors in request order."""
         import requests
+        try:
+            r = self.session.post(self.url, json=body, timeout=self.timeout)
+        except requests.RequestException as e:
+            raise EmbedderError(f"embedder unreachable at {self.url}: {e}") from e
+        if r.status_code != 200:
+            raise EmbedderError(f"embedder error {r.status_code}: {r.text[:300]}")
+        data = r.json()["data"]
+        out: list = [None] * len(data)
+        for d in data:
+            e = d["embedding"]
+            out[d["index"]] = (np.frombuffer(base64.b64decode(e), dtype=np.float32) if isinstance(e, str)
+                               else np.asarray(e, dtype=np.float32))
+        return out
+
+    def embed_chat(self, messages_list: list[list[dict]]) -> np.ndarray:
+        """Conversations in batched chat embeddings requests (``messages`` = a list of conversations)."""
+        out: list[np.ndarray] = []
+        for i in range(0, len(messages_list), self.batch):
+            chunk = messages_list[i:i + self.batch]
+            got = self._post({"model": self.model, "messages": chunk, "encoding_format": "base64"})
+            if len(got) != len(chunk):
+                raise EmbedderError(f"embedder returned {len(got)} vectors for {len(chunk)} conversations")
+            out.extend(got)
+            if (i // self.batch) % 50 == 0:
+                print(f"[embed] server chat {min(i + self.batch, len(messages_list))}/{len(messages_list)}", flush=True)
+        return l2(np.stack(out).astype(np.float32))
+
+    def embed(self, id_lists: list[list[int]]) -> np.ndarray:
         out: list[np.ndarray] = []
         for i in range(0, len(id_lists), self.batch):
             chunk = id_lists[i:i + self.batch]
-            body = {"model": self.model, "input": chunk, "encoding_format": "base64"}
-            try:
-                r = self.session.post(self.url, json=body, timeout=self.timeout)
-            except requests.RequestException as e:
-                raise EmbedderError(f"embedder unreachable at {self.url}: {e}") from e
-            if r.status_code != 200:
-                raise EmbedderError(f"embedder error {r.status_code}: {r.text[:300]}")
-            got: list = [None] * len(chunk)
-            for d in r.json()["data"]:
-                e = d["embedding"]
-                got[d["index"]] = (np.frombuffer(base64.b64decode(e), dtype=np.float32) if isinstance(e, str)
-                                   else np.asarray(e, dtype=np.float32))
-            out.extend(got)
+            out.extend(self._post({"model": self.model, "input": chunk, "encoding_format": "base64"}))
             if (i // self.batch) % 50 == 0:
                 print(f"[embed] server {min(i + self.batch, len(id_lists))}/{len(id_lists)}", flush=True)
         return l2(np.stack(out).astype(np.float32))
 
 
-def make_backend(url: str | None, model: str, max_len: int, gpu_mem: float = 0.85, served_name: str | None = None):
+def make_backend(url: str | None, model: str, max_len: int, gpu_mem: float = 0.85, served_name: str | None = None,
+                 convert: str | None = None, max_images: int = 4):
     """Server backend when ``url`` is given, else offline vLLM."""
-    return ServerBackend(url, served_name or model) if url else OfflineBackend(model, max_len, gpu_mem)
+    return (ServerBackend(url, served_name or model) if url
+            else OfflineBackend(model, max_len, gpu_mem, max_images=max_images, convert=convert))
