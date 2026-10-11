@@ -130,6 +130,7 @@ function blankState() {
   return {
     mode: 'ask',
     state: '',
+    images: [],            // [{name, url (data: URI), bytes}] -- not persisted or shared: too big
     stateJson: false,
     questions: [],
     rankInstructions: '',
@@ -253,9 +254,48 @@ function fillModels(models) {
 
 /* ───────────────────────────── request building ───────────────────────────── */
 
-function parsedState() {
+function textState() {
   if (!S.stateJson) return S.state;
   return JSON.parse(S.state);          // caller guards
+}
+
+/** The wire-format state: the text as is, or text + image content parts when images are attached. */
+function parsedState() {
+  if (!S.images.length) return textState();
+  return [{ type: 'text', text: textState() },
+          ...S.images.map((im) => ({ type: 'image_url', image_url: { url: im.url } }))];
+}
+
+/** Content parts of a state, or null. */
+function stateParts(state) {
+  return Array.isArray(state) && state.length && state.every((p) => p && typeof p === 'object' &&
+    ['text', 'image_url', 'image'].includes(p.type)) ? state : null;
+}
+
+/** A copy of a request body with data: URLs shortened, for display only. */
+function abbrev(body) {
+  const short = (u) => (typeof u === 'string' && u.startsWith('data:')
+    ? u.slice(0, u.indexOf(',') + 1) + `\u2026 (${(u.length - u.indexOf(',') - 1).toLocaleString()} base64 chars)` : u);
+  const fix = (st) => {
+    const parts = stateParts(st);
+    return parts ? parts.map((p) => (p.type === 'image_url'
+      ? { type: 'image_url', image_url: { url: short(typeof p.image_url === 'string' ? p.image_url : p.image_url.url) } }
+      : p)) : st;
+  };
+  const b = { ...body };
+  if ('state' in b) b.state = fix(b.state);
+  if ('context' in b) b.context = fix(b.context);
+  return b;
+}
+
+/** Python for a state: with_images(text, [files]) when it carries images, else its repr. */
+function pyState(state, indent) {
+  const parts = stateParts(state);
+  if (!parts) return pyRepr(state, indent);
+  const text = parts.filter((p) => p.type === 'text').map((p) => p.text);
+  const names = S.images.map((im) => im.name);
+  const imgs = parts.filter((p) => p.type !== 'text').map((p, i) => names[i] || `image${i + 1}.png`);
+  return `with_images(${pyRepr(text.length === 1 ? text[0] : text.join('\n\n'), indent)}, ${pyRepr(imgs, indent)})`;
 }
 
 function questionToWire(q) {
@@ -291,7 +331,7 @@ function buildRequest(model) {
   if (S.stateJson) {
     try { JSON.parse(S.state); } catch (e) { throw new Error('State is not valid JSON: ' + e.message); }
   }
-  if (!S.state.trim()) throw new Error('Add a state — the context the questions are asked about.');
+  if (!S.state.trim() && !S.images.length) throw new Error('Add a state — the context the questions are asked about.');
 
   if (S.mode === 'rank') {
     const answers = rankCandidateList();
@@ -562,16 +602,16 @@ function renderCode() {
   const base = baseUrl() || location.origin;
   const auth = apiKey() ? ` \\\n  -H "Authorization: Bearer $CLM_API_KEY"` : '';
   $('#view-curl').textContent =
-    `curl -s ${base}${req.endpoint} \\\n  -H 'Content-Type: application/json'${auth} \\\n  -d ${shQuote(JSON.stringify(req.body, null, 2))}`;
+    `curl -s ${base}${req.endpoint} \\\n  -H 'Content-Type: application/json'${auth} \\\n  -d ${shQuote(JSON.stringify(abbrev(req.body), null, 2))}`;
 
   if (req.endpoint === '/v1/rank') {
     $('#view-python').textContent =
 `# pip install -r requirements.txt  (from a clone of the CLM repo)
-from clm import CLMClient
+from clm import CLMClient${stateParts(req.body.context) ? ', with_images' : ''}
 
 client = CLMClient(base_url=${JSON.stringify(base)}${apiKey() ? ', api_key=os.environ["CLM_API_KEY"]' : ''})
 ranked = client.rank(
-    context=${pyRepr(req.body.context, 4)},
+    context=${pyState(req.body.context, 4)},
     question=${pyRepr(req.body.question, 4)},
     answers=${pyRepr(req.body.answers, 4)},${req.body.model !== 'clm-latest' ? `\n    model=${JSON.stringify(req.body.model)},` : ''}
 )
@@ -592,11 +632,11 @@ for r in ranked:
 
   $('#view-python').textContent =
 `# pip install -r requirements.txt  (from a clone of the CLM repo)
-from clm import CLMClient, ${kinds.join(', ')}
+from clm import CLMClient, ${kinds.join(', ')}${stateParts(req.body.state) ? ', with_images' : ''}
 
 client = CLMClient(base_url=${JSON.stringify(base)}${apiKey() ? ', api_key=os.environ["CLM_API_KEY"]' : ''})
 r = client.system_one(
-    state=${pyRepr(req.body.state, 4)},
+    state=${pyState(req.body.state, 4)},
     questions={
 ${qs}
     },${req.body.model !== 'clm-latest' ? `\n    model=${JSON.stringify(req.body.model)},` : ''}
@@ -615,7 +655,7 @@ function showView(name) {
 }
 
 function renderJsonPreview() {
-  try { renderJson(buildRequest().body); } catch (e) { $('#view-json').textContent = '// ' + e.message; }
+  try { renderJson(abbrev(buildRequest().body)); } catch (e) { $('#view-json').textContent = '// ' + e.message; }
 }
 
 /* ───────────────────────────── question editor ───────────────────────────── */
@@ -747,11 +787,62 @@ function critRow(opt, onDesc, onKey, onRemove) {
   return row;
 }
 
+/* ───────────────────────────── image states ───────────────────────────── */
+
+const MAX_IMAGES = 4;
+
+function attachImage(file) {
+  return new Promise((resolve) => {
+    if (S.images.length >= MAX_IMAGES) {
+      showError(Object.assign(new Error(`At most ${MAX_IMAGES} images per state (the encoder's per-prompt limit).`),
+        { validation: true }), null);
+      return resolve();
+    }
+    const r = new FileReader();
+    r.onload = () => {
+      S.images.push({ name: file.name || 'pasted.png', url: r.result, bytes: file.size });
+      renderThumbs(); renderCode(); if (!lastResult) renderJsonPreview();
+      resolve();
+    };
+    r.onerror = () => resolve();
+    r.readAsDataURL(file);
+  });
+}
+
+function removeImage(i) {
+  S.images.splice(i, 1);
+  renderThumbs(); renderCode(); if (!lastResult) renderJsonPreview();
+}
+
+function renderThumbs() {
+  const wrap = $('#state-thumbs');
+  wrap.innerHTML = '';
+  wrap.hidden = !S.images.length;
+  $('#images-hint').textContent = S.images.length
+    ? `${S.images.length} image${S.images.length === 1 ? '' : 's'} attached — the state goes as text + image parts`
+    : 'screenshots or frames, sent with the text as content parts';
+  S.images.forEach((im, i) => {
+    const d = document.createElement('div');
+    d.className = 'thumb';
+    d.title = im.name;
+    const img = document.createElement('img');
+    img.src = im.url; img.alt = im.name;
+    const sz = document.createElement('span');
+    sz.className = 'sz'; sz.textContent = `${im.name} · ${(im.bytes / 1024).toFixed(0)} kB`;
+    const rm = document.createElement('button');
+    rm.className = 'rm'; rm.textContent = '×'; rm.title = 'Remove';
+    rm.addEventListener('click', () => removeImage(i));
+    d.append(img, sz, rm);
+    wrap.appendChild(d);
+  });
+}
+
 /* ───────────────────────────── sync form <-> state ───────────────────────────── */
 
 function paint() {
   $('#state').value = S.state;
   $('#state-json').checked = S.stateJson;
+  renderThumbs();
   $('#rank-instructions').value = S.rankInstructions;
   $('#rank-candidates').value = S.rankCandidates;
   $('#model').value = S.model;
@@ -773,7 +864,7 @@ function updateCount() {
 }
 
 function save() {
-  try { localStorage.setItem(LS.req, JSON.stringify(S)); } catch (e) { /* private mode */ }
+  try { localStorage.setItem(LS.req, JSON.stringify({ ...S, images: [] })); } catch (e) { /* private mode */ }
 }
 
 /* ───────────────────────────── share links ───────────────────────────── */
@@ -785,7 +876,7 @@ const b64u = {
 
 function shareLink() {
   const u = new URL(location.href);
-  u.hash = 'r=' + b64u.enc(JSON.stringify(S));
+  u.hash = 'r=' + b64u.enc(JSON.stringify({ ...S, images: [] }));
   return u.toString();
 }
 
@@ -891,6 +982,18 @@ function init() {
 
   // fields
   $('#state').addEventListener('input', (e) => { S.state = e.target.value; updateCount(); save(); });
+  $('#attach-image').addEventListener('click', () => $('#state-images').click());
+  $('#state-images').addEventListener('change', async (e) => {
+    for (const f of e.target.files) await attachImage(f);
+    e.target.value = '';
+  });
+  // paste a screenshot straight into the state
+  $('#state').addEventListener('paste', async (e) => {
+    const files = [...(e.clipboardData?.files || [])].filter((f) => f.type.startsWith('image/'));
+    if (!files.length) return;
+    e.preventDefault();
+    for (const f of files) await attachImage(f);
+  });
   $('#state-json').addEventListener('change', (e) => { S.stateJson = e.target.checked; updateCount(); save(); });
   $('#rank-instructions').addEventListener('input', (e) => { S.rankInstructions = e.target.value; save(); });
   $('#rank-candidates').addEventListener('input', (e) => { S.rankCandidates = e.target.value; save(); });

@@ -552,3 +552,14 @@ select {
 @media (prefers-reduced-motion: reduce) {
   * { animation: none !important; transition: none !important; }
 }
+
+/* ───────────────────────────── image states ───────────────────────────── */
+.images-row { display: flex; align-items: center; gap: 10px; margin-top: 8px; }
+.thumbs { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.thumb { position: relative; width: 84px; height: 56px; border: 1px solid var(--faint); border-radius: 6px;
+         overflow: hidden; background: rgba(127, 127, 127, .08); }
+.thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.thumb .rm { position: absolute; top: 2px; right: 2px; width: 18px; height: 18px; line-height: 16px; padding: 0;
+             border-radius: 50%; border: 0; background: rgba(0, 0, 0, .65); color: #fff; font-size: 12px; cursor: pointer; }
+.thumb .sz { position: absolute; left: 0; right: 0; bottom: 0; padding: 1px 4px; font-size: 10px;
+             background: rgba(0, 0, 0, .55); color: #fff; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }

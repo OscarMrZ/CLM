@@ -99,6 +99,13 @@
         <textarea id="state" rows="6" spellcheck="false"
                   placeholder="The context the model reasons about — a customer message, an agent trajectory, a page of text, a game frame…"></textarea>
         <div id="state-json-err" class="inline-err" hidden></div>
+        <div class="images-row">
+          <input type="file" id="state-images" accept="image/*" multiple hidden>
+          <button class="btn-ghost" id="attach-image"
+                  title="Attach screenshots or frames: the state is sent as text + image parts (needs a multimodal encoder)">+ image</button>
+          <span class="hint" id="images-hint">screenshots or frames, sent with the text as content parts</span>
+        </div>
+        <div id="state-thumbs" class="thumbs" hidden></div>
       </div>
 
       <!-- ask mode -->
