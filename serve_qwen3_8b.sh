@@ -6,14 +6,15 @@
 #
 # Usage: GPU=0 PORT=8090 UTIL=0.35 ./serve_qwen3_8b.sh
 set -u
+MODEL="${MODEL:-Qwen/Qwen3-8B}"          # Qwen/Qwen3-8B-FP8 fits a 16 GB GPU (bf16 needs ~17 GB)
 GPU="${GPU:-0}"
 PORT="${PORT:-8090}"
 UTIL="${UTIL:-0.35}"
 MAXLEN="${MAXLEN:-2048}"
 LOGDIR="${LOGDIR:-$(cd "$(dirname "$0")/.." && pwd)/logs}"
 mkdir -p "$LOGDIR"
-echo "serving Qwen3-8B pooling on GPU $GPU port $PORT (util $UTIL)"
-CUDA_VISIBLE_DEVICES=$GPU exec vllm serve Qwen/Qwen3-8B \
+echo "serving $MODEL pooling on GPU $GPU port $PORT (util $UTIL)"
+CUDA_VISIBLE_DEVICES=$GPU exec vllm serve "$MODEL" \
     --served-model-name qwen3-8b \
     --runner pooling \
     --enforce-eager \
